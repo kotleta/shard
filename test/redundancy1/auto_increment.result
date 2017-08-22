@@ -1,0 +1,111 @@
+env = require('test_run')
+---
+...
+test_run = env.new()
+---
+...
+test_run:cmd("create server master1 with script='redundancy1/master1.lua', lua_libs='redundancy1/lua/shard.lua'")
+---
+- true
+...
+test_run:cmd("create server master2 with script='redundancy1/master2.lua', lua_libs='redundancy1/lua/shard.lua'")
+---
+- true
+...
+test_run:cmd("start server master1")
+---
+- true
+...
+test_run:cmd("start server master2")
+---
+- true
+...
+shard.wait_connection()
+---
+...
+shard.demo:auto_increment{'test'}
+---
+- - [1, 'test']
+...
+shard.demo:auto_increment{'test2'}
+---
+- - [4, 'test2']
+...
+shard.demo:auto_increment{'test3'}
+---
+- - [7, 'test3']
+...
+shard.demo:q_auto_increment(1, {'test4'})
+---
+- [10, 'test4']
+...
+batch = shard.q_begin()
+---
+...
+batch.demo:q_auto_increment(2, {'test5'})
+---
+- [13, 'test5']
+...
+batch.demo:q_auto_increment(3, {'test6'})
+---
+- [16, 'test6']
+...
+batch:q_end()
+---
+...
+shard.wait_operations()
+---
+...
+box.space.demo:select()
+---
+- - [10, 'test4']
+  - [16, 'test6']
+...
+test_run:cmd("switch master1")
+---
+- true
+...
+shard.wait_operations()
+---
+...
+box.space.demo:select()
+---
+- - [4, 'test2']
+...
+test_run:cmd("switch master2")
+---
+- true
+...
+shard.wait_operations()
+---
+...
+box.space.demo:select()
+---
+- - [1, 'test']
+  - [7, 'test3']
+  - [13, 'test5']
+...
+test_run:cmd("switch default")
+---
+- true
+...
+box.space.operations:select()
+---
+- - ['1', 2, [[512, 'insert', [[10, 'test4']]]]]
+  - ['3', 2, [[512, 'insert', [[16, 'test6']]]]]
+...
+_ = test_run:cmd("stop server master1")
+---
+...
+_ = test_run:cmd("stop server master2")
+---
+...
+test_run:cmd("cleanup server master1")
+---
+- true
+...
+test_run:cmd("cleanup server master2")
+---
+- true
+...
+test_run:cmd("restart server default with cleanup=1")

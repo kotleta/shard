@@ -1,229 +1,413 @@
-## Введение
+# Tarantool sharding module
+[![Tests status](https://travis-ci.org/tarantool/shard.svg?branch=master)](https://travis-ci.org/tarantool/shard)
 
-Может работать в двух режимах:
+An application-level library that provides sharding and client-side
+reliable replication for [tarantool](http://tarantool.org). Implements
+a single-phase and two-phase protocol operations (with batching
+support), monitors availability of nodes and automatically expells
+failed nodes from the cluster.
 
-* Режим шардинга
-* Режим решардинга
+To shard data across nodes, a variant of consistent hashing is
+used. The shard key is determined automatically based on sharded space
+description.
 
-Режим решардинга определяется по факту наличия двух функций выбора шарда (`prev` & `curr`).
-
-## Инсталляция
-
-Весь функционал шардинга расположен в одном файле `shard.lua`.
-
-Подключение производится при выполнении директивы в Вашем `init.lua`:
-
-```lua
-
-    require 'shard'
-
+## Installation
+1. Add [tarantool repository](http://tarantool.org/download.html) for
+   yum or apt
+2. Install
+```bash
+$sudo [yum|apt-get] install tarantool tarantool-shard tarantool-pool
 ```
 
-После этого момента становятся доступными функции `box.shard.*`.
+## Terminology
+
+* redundancy - the redundancy factor. How many copies of each tuple to
+  maintain in the cluster
+* zone - a redundancy zone. May represent a single machine or a single
+  data center. The number of zones must be greater or equal to the
+  redundancy factor: duplicating data in the same zone doesn't
+  increase availability
+
+## Usage example
+
+This example starts a tarantool instance that connects to itself,
+creating a sharding configuration with a single zone and a single
+server.
+
+If you need more servers, add entries to the `servers` part of the
+configuration. See "Configuration" below for details.
+
+```lua
+local shard = require('shard')
+local json = require('json')
+
+-- tarantool configuration
+box.cfg {
+    wal_mode = 'none',
+    listen = 33021
+}
+
+box.schema.create_space('demo', {if_not_exists = true})
+box.space.demo:create_index('primary',
+                      {parts={1, 'unsigned'}, if_not_exists=true})
+
+box.schema.user.grant('guest', 'read,write,execute',
+                      'universe', nil, {if_not_exists = true})
+
+box.schema.user.grant('guest', 'replication',
+                      nil, nil, {if_not_exists = true})
 
 
-### Алгоритм
+-- sharding configuration
+shard.init {
+    servers = {
+        { uri = 'localhost:33021', zone = '0' },
+    },
 
-#### Шардинг
+    login = 'guest',
+    password = '',
+    redundancy = 1
+}
 
-Пользователь определяет текущую функцию определения номера шарда (`curr`),
-а так же список шардов. Это действие необходимо провести при конфигурировании
-каждого шарда.
+shard.demo:insert({1, 'test'})
+shard.demo:replace({1, 'test2'})
+shard.demo:update({1}, {{'=', 2, 'test3'}})
+shard.demo:insert({2, 'test4'})
+shard.demo:insert({3, 'test5'})
+shard.demo:delete({3})
 
-Далее при запросах по ключу в запросе при помощи вызова функции `curr`
-определяется номер шарда, на котором расположены нужные данные и выполняется
-запрос к этому шарду при помощи библиотеки `box.net.box`.
+print(json.encode(shard.demo:select({1})))
+print(json.encode(shard.demo:select({2})))
+```
 
+## Testing
 
-#### Решардинг
+Sharding module can be tested with [tarantool functional testing framework](https://github.com/tarantool/test-run):
+```bash
+pip install -r test-run/requirements.txt
+python test/test-run.py
+```
 
-Помимо обычной функции `curr` пользователь определяет еще и функцию `prev`,
-которая по аналогии с функцией `curr` возвращает номер шарда по ключу. Но эта
-функция описывает предыдущую схему шардинга.
+## Configuration
 
-Далее при запросах работает следующий алгоритм:
+```lua
+cfg = {
+    servers = {
+        { uri = 'localhost:33130', zone = '0' },
+        { uri = 'localhost:33131', zone = '1' },
+        { uri = 'localhost:33132', zone = '2' }
+    },
+    login = 'tester',
+    password = 'pass',
+    monitor = true,
+    pool_name = "default",
+    redundancy = 3,
+    rsd_max_rps = 1000,
+    replication = true
+}
+```
 
-1. ключ извлекается из запроса
-1. определяется номер шарда `curr`.
-1. выполняются операции с шардом `curr`, если данных на `curr` нет,
-то выполняется операции с шардом `prev`.
+Where:
 
-Для того чтобы выполнить решардинг нужно произвести следующие операции:
+* `servers`: a list of dictionaris {uri = '', zone = ''} that describe
+  individual servers in the sharding configuration
+* `login` and `password`: credentials that will be used to connect to
+  `servers`
+* `monitor`: whether to do active checks on the servers and remove
+  them from sharding if they become unreachable (default `true`)
+* `pool_name`: display name of the connection pool created for the
+  group of `servers`. This only matters if you
+  use [connpool](https://github.com/tarantool/connpool) module in
+  parallel to the sharding module for other purposes. Otherwise you
+  may skip this option. (default `'default'`)
+* `redundancy`: How many copies of each tuple to maintain in the
+  cluster. (defaults to number of zones)
+* `replication`: Set to `true` if redundancy is handled by replication
+  (default is `false`)
 
-1. для всех хостов определить функции `curr` и `prev`, а так же обновить
-список шардов.
-1. Запустить процесс `copy` на всех хостах (этот процесс будет вытеснять
-данные с хоста `prev` на хост `curr`)
-1. По завершении процесса копирования, необходимо удалить функцию `prev`
-из конфигурации всех шардов
-1. Запустить процесс `cleanup` на всех шардах для удаления устаревших данных.
+Timeout options are global, and can be set before calling the `init()`
+funciton, like this:
 
-##### Процесс `copy`
+```lua
+shard = require 'shard'
 
-Условия запуска:
+local cfg = {...}
 
-1. текущий шард помечен как `rw`
-1. на шарде прописаны обе функции `curr` и `prev`
+shard.REMOTE_TIMEOUT = 210
+shard.HEARTBEAT_TIMEOUT = 500
+shard.DEAD_TIMEOUT = 10
+shard.RECONNECT_AFTER = 30
 
-Процесс запускается при вызове функции `box.shard.copy()`,
-далее этот процесс обходит все спейсы тарантула и для каждой записи каждого
-спейса выполняет вычисление номера шарда `curr`, а так же (при необходимости)
-номера шарда `prev`.
+shard.init(cfg)
+```
 
-В случае если `prev` указывает на текущий шард, а `curr` указывает на другой
-шард, то выполняет `copy_from` (которая по сути является `insert nothrow`) тапла на шард `curr`
-(удаление тапла на своем шарде не производит).
-В случае если на шарде `curr` есть тапл с таким ключом, то `insert` не производится.
+Where:
 
-Функция `box.shard.copy()` возвращает список таплов каждый из которых содержит
-два поля:
-
-1. номер обработанного спейса
-1. количество скопированных в нем записей (может быть 0)
-
-##### Процесс `cleanup`
-
-Условия запуска:
-
-1. текущий шард помечен как `rw`
-1. на шарде прописана только одна функция - `curr`
-(то есть режим решардинга отключен)
-
-Процесс запускается при вызове функции `box.shard.cleanup()`, далее
-этот процесс обходит все спейсы тарантула и для каждой записи каждого спейса
-выполняет вычисление номера шарда `curr`. Если номер шарда `curr` для записи
-не равен текущему номеру шарда `me`, то производится удаление этой записи.
-
-Функция `box.shard.cleanup()` возвращает список таплов, каждый из которых
-содержит два поля:
-
-1. номер обработанного спейса
-1. количество удаленных в нем записей.
+* `REMOTE_TIMEOUT` is a timeout in seconds for data access operations,
+  like insert/update/delete. (default is `210`)
+* `HEARTBEAT_TIMEOUT` is a timeout in seconds before a heartbeat call
+  will fail. (default is `500`)
+* `DEAD_TIMEOUT` is a timeout in seconds after which the
+  non-responding node will be expelled from the cluster (default is
+  10)
+* `RECONNECT_AFTER` allows you to ignore transient failures in remote
+  operations. Terminated connections will be re-established after a
+  specified timeout in seconds. Under the hood, it uses the
+  `reconnect_after` option for `net.box`. (disabled by default,
+  i.e. `msgpack.NULL`)
 
 ## API
 
-### Конфигурирование
+### Configuration and cluster management
 
-Конфигурирование выполняется одной функцией:
+#### `shard.init(cfg)`
 
-```lua
+Initialize sharding module, connect to all nodes and start monitoring them.
 
-box.shard.schema.config({параметр = значение})
+* cfg - sharding configuration (see Configuration above)
 
+Note, that sharding configuration can be changed dynamically, and it
+is your job to make sure that the changes get reflected in this
+configuration. Because when you restart your cluster, the topology
+will be read from whatever you pass to `init()`.
+
+#### `shard.get_heartbeat()`
+
+Returns status of the cluster from the point of view of each node.
+
+Example output:
+
+```yaml
+---
+- localhost:3302:
+    localhost:3302: {'try': 0, 'ts': 1499270503.9233}
+    localhost:3301: {'try': 0, 'ts': 1499270507.0284}
+  localhost:3301:
+    localhost:3302: {'try': 0, 'ts': 1499270504.9097}
+    localhost:3301: {'try': 0, 'ts': 1499270506.8166}
+...
 ```
 
-Конфигурирует (или переконфигурирует) шардхост (или прокси-хост), принимая
-следующие параметры:
+#### `shard.is_table_filled()`
 
-* `list` - список шардов и их типы
-* `me` - номер текущего шарда в списке доступов (либо 0, если данный шард
-является прокси)
-* `mode` - режим работы текущего шарда (`ro`, `rw`)
-* `curr` - функция, возвращающая по номеру спейса ключу номер шарда на
-котором должна быть расположена запись в текущей схеме шардирования.
-* `prev` - функция, возвращающая по номеру спейса и ключу номер шарда
-на котором должна быть расположена запись в предыдущей схеме шардирования.
+Returns `true` if the heartbeat table contains data about each node,
+from the point of view of each other node. If the sharding module
+hasn't yet filled in the heartbeats, or there are dead nodes, this
+function will return `false`.
 
-Вызов функции `box.shard.schema.config` реконфигурирует только те параметры
-которые переданы при данном вызове.
-Прочие параметры оставляет в предыдущем состоянии.
+#### `shard.is_connected()`
 
-#### Список шардов
+Returns `true` if all shards are connected and operational.
 
-Список шардов представляет собой `lua` табличку, которая представляет собой
-массив массивов, описывающих шарды.
+#### `shard.wait_connection()`
 
-Каждая запись, описывающая шард имеет следующие поля:
+Wait until all shards are connected and operational.
 
-1. режим работы шарда `mode`.
-Может иметь значения:
-`ro` - шард только для чтения,
-`rw` - шард для записи и чтения.
-1. вес шарда (число 0 - 1000)
-1. Параметры для коннекта к шарду (`host`, `port`)
+#### `shard_status()`
 
-Примечания:
+Returns the status of all shards: whether they are online, offline or
+in maintenance.
 
-1. в описаниях каждого шарда не может быть более одного шарда в режиме `rw`
-1. модифицирующие операции всегда обращаются к хостам `rw`. Немодифицирующие
-могут обращаться к хостам `ro` или `rw` в зависимости от семантики вызова.
+Example output:
 
-### `box.shard.select(space, key[, subkey, ...])`
+```yaml
+---
+- maintenance: []
+  offline: []
+  online:
+  - uri: localhost:3301
+    id: 1
+  - uri: localhost:3302
+    id: 2
+  - uri: localhost:3303
+    id: 3
+...
+```
 
-Выполняет запрос данных по ключу (ключ возможно составной). Вычисляет по
-переданным `space:key` значение номера шарда `curr` и переадресует этот запрос
-на нужный шард.
-В случае, если режим решардинга работает, а записи с данным ключем нет,
-то переадресует запрос так же шарду `prev`.
+#### `remote_append(servers)`
 
-Примечания:
+Appends a pair of redundant instances to the cluster, and initiates
+resharding.
 
-1. в случае составного ключа он все должен быть полным (то есть выборки
-по частично определенному ключу нескольких записей невозможны)
-1. функция `select` может обращаться к хостам "только для чтения". При этом
-используется алгоритм выбора хоста в соответствии с весом хоста, определенным
-при конфигурировании.
+* `servers` - table of servers in the same format as in config
 
-### `box.shard.eselect(mode, space, key[, subkey, ...])`
+This function should be called on one node and will propagate changes
+everywhere.
 
-То же что и `box.shard.select`, но может принять параметр `mode`,
-который указывает что предпочтительнее при выборке. `mode` может принимать
-следующие значения:
+Example:
 
-* `ro` - означает что *предпочтительно* делать выборку с хостов, помеченных
-как "только для чтения".
-* `rw` - означает что *необходимо* сделать выборку исключительно с хостов,
-помеченных как "для чтения и записи".
+```lua
+remote_append({{uri="localhost:3305", zone='2'},
+               {uri="localhost:3306", zone='2'}})
+```
 
-Вызов `box.shard.eselect('ro', ...)` полностью эквивалентен вызову
-`box.shard.select`.
+Returns: `true` on success
 
-### `box.shard.insert(space, ...)`
+#### `remote_join(id)`
 
-Вставляет тапл по следующему алгоритму:
+If the node got expelled from the cluster, you may bring it back by
+using `remote_join()`. It will reconnect to the node and allow write
+access to it.
 
-1. извлекает ключ из переданного тапла
-1. вычисляет по ключу номер шарда (`curr`)
-1. передает управление хосту `curr` для выполнения дальнейших операций
-1. на хосте `curr`: если запись с таким ключом есть, то возвращает ошибку
-1. на хосте `curr`: делает запрос `select` на хост `prev`, если тот определен.
-1. на хосте `curr`: в случае если на хосте `prev` данная запись существует,
-то возвращает ошибку, иначе делает `insert`.
+There are 2 reasons why it may happen: either the node has died, or
+you've called `remote_unjoin()` on it.
 
-### `box.shard.replace(space, ...)`
+Example:
 
-Вставляет (возможно заменяя) запись по следующему алгоритму.
+```lua
+remote_join(2)
+```
 
-1. извлекает ключ из переданного тапла
-1. вычисляет по ключу номер шарда (`curr`)
-1. передает управление на хост `curr` для выполнения дальнейших операций
-1. делает вставку `replace` на шарде `curr`
+Returns: `true` on success
 
-### `box.shard.delete(space, key[, subkey, ...])`
+#### `remote_unjoin(id)`
 
-Удаляет запись
+Put the node identified by `id` to maintenance mode. It will not
+receive writes, and will not be returned by the `shard()` function.
 
-1. передает управление хосту `curr`
-1. выполняет удаление на `prev`
-1. выполняет удаление на `curr`
-1. `return exists_from_curr or exists_from_prev` 
+### Single phase operations
 
+#### `shard.space.insert(tuple)`
 
-### `box.shard.update(space, key, [subkey, ... ] format, … )`
+Inserts `tuple` to the shard space.
 
-1. передает управление хосту `curr`
-1. если запись присутствует, то выполняет `return update( ... )`
-1. выбирает запись с хоста `prev`
-1. если запись присутствует, то выполняет `return update( ... )`
-1. выполняет `insert( {selected} ); return update( ... )`
+`tuple[1]` is treated as shard key.
 
-### `box.shard.call(mode, procname, ... )`
+Returns: table with results of individual `insert()` calls on each
+redundant node.
 
-1. выбирает случайный шард
-1. выбирает хост в пределах выбранного шарда, удовлетворяющий `mode`
-1. делает вызов указанной функции на выбранном хосте
+#### `shard.space.replace(tuple)`
+
+Replaces `tuple` across the shard space.
+
+`tuple[1]` is treated as shard key.
+
+Returns: table with results of individual `replace()` calls on each
+redundant node.
+
+#### `shard.space.delete(key)`
+
+Deletes tuples with primary key `key` across the shard space.
+
+`key[1]` is treated as shard key.
+
+Returns: table with results of individual `delete()` calls on each
+redundant node.
 
 
-	
+#### `shard.space.update(key, {{operator, field_no, value}, ...})`
+
+Update `tuple` across the shard space. Behaves the same way as Tarantool's [update()](http://tarantool.org/doc/book/box/box_space.html?highlight=insert#lua-function.space_object.update).
+
+`key[1]` is treated as shard key.
+
+Returns: table with results of individual `update()` calls on each
+redundant node.
 
 
+#### `shard.space.auto_increment(tuple)`
+
+Inserts `tuple` to the shard space, automatically incrementing its primary key.
+
+If primary key is numeric, `auto_increment()` will use the next integer number.
+If primary key is string, `auto_increment()` will generate a new UUID.
+
+Shard key is determined from the space schema, unlike the `insert()` operation.
+
+Returns: table with results of individual `auto_increment()` calls on
+each redundant node. Return value of each `auto_increment()` is the
+same as in the `insert()` call.
+
+
+### Two-phase operations
+
+Two phase operations work, well, in two phases. The first phase pushes
+the operation into an auxiliary space "operations" on all the involved
+shards, according to the redundancy factor. As soon as the operation
+is propagated to the shards, a separate call triggers execution of the
+operation on all shards. If the caller dies before invoking the second
+phase, the shards figure out by themselves that the operation has been
+propagated and execute it anyway (it only takes a while, since the
+check is done only once in a period of time).  The operation id is
+necessary to avoid double execution of the same operation (at most
+once execution semantics) and most be provided by the user. The status
+of the operation can always be checked, given its operation id, and
+provided that it has not been pruned from operations space.
+
+#### `shard.space.q_insert(operation_id, tuple)`
+
+Inserts `tuple` to the shard space.
+
+* `operation_id` is a unique operation identifier (see "Tho-phase operations")
+* `tuple[1]` is treated as shard key.
+
+Returns: `tuple`
+
+#### `shard.space.q_replace(operation_id, tuple)`
+
+Replaces `tuple` across the shard space.
+
+* `operation_id` is a unique operation identifier (see "Tho-phase operations")
+* `tuple[1]` is treated as shard key.
+
+Returns: `tuple`
+
+#### `shard.space.q_delete(operation_id, key)`
+
+Deletes tuples with primary key `key` across the shard space.
+
+* `operation_id` is a unique operation identifier (see "Tho-phase operations")
+* `key` is treated as a shard key.
+
+Returns: nothing
+
+#### `shard.space.q_update(operation_id, key, {{operator, field_no, value}, ...})`
+
+Update `tuple` across the shard space. Behaves the same way as Tarantool's [update()](http://tarantool.org/doc/book/box/box_space.html?highlight=insert#lua-function.space_object.update).
+
+* `operation_id` is a unique operation identifier (see "Tho-phase operations")
+* `key` is treated as shard key.
+
+Returns: nothing
+
+#### `shard.space.q_auto_increment(tuple)`
+
+Inserts `tuple` to the shard space, automatically incrementing its primary key.
+
+* `operation_id` is a unique operation identifier (see "Tho-phase operations")
+
+If primary key is numeric, `auto_increment()` will use the next integer number.
+If primary key is string, `auto_increment()` will generate a new UUID.
+
+Shard key is determined from the space schema, unlike the `insert()` operation.
+
+Returns: `tuple`
+
+#### `shard.check_operation(operation_id, tuple_id)`
+
+Function checks the operation status on all nodes. If the operation
+hasn't finished yet - waits for its completion for up to 5 seconds.
+
+* `operation_id` - unique operation identifier
+* `tuple_id` - tuple primary key
+
+Returns: `true`, if the operation has completed, `false` otherwise.
+
+#### `shard.q_begin()|batch_obj.q_end()`
+
+`q_begin()` returns an object that wraps multiple sequential two-phase
+operations into one batch. You can use it the same way you use the
+shard object:
+
+```lua
+batch_obj = shard.q_begin()
+batch_obj.demo:q_insert(1, {0, 'test'})
+batch_obj.demo:q_replace(2, {0, 'test2'})
+batch_obj:q_end()
+```
+
+When you call `q_end()`, the batch will be executed in one shot.
+
+#### `wait_operations()`
+
+If there are pending two-phase operations, wait until they complete.
