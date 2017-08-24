@@ -1,12 +1,12 @@
 package = 'shard'
 version = 'scm-1'
 source  = {
-    url    = 'git://github.com/tarantool/shard.git',
+    url    = 'git://github.com/kotleta/shard.git',
     branch = 'master',
 }
 description = {
     summary  = "Lua sharding for Tarantool",
-    homepage = 'https://github.com/tarantool/shard.git',
+    homepage = 'https://github.com/kotleta/shard.git',
     license  = 'BSD',
 }
 dependencies = {
